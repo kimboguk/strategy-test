@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 results/
+sweep_*_results.csv
+sweep_results.csv
