@@ -59,7 +59,13 @@ TV_LOOKBACK_DAYS = 20               # 거래대금 이동평균 기간
 SLOT_FRACTION = 0.0                 # 0 = legacy (cash/N 균등). >0 = 총자산 대비 슬롯 비중
 MIN_HISTORY_DAYS = 252              # 최소 데이터 일수 (허위신호 방지)
 KR_CURRENCY = "KRW"
-ESTIMATION_METHOD = "bayes_stein"
+
+# ── Ranking method ─────────────────────────────────────────────
+# ATH-matched horizon: 504일 lookback이 ATH 신호와 정합
+# Sharpe (vol-adjusted) > Bayes-Stein (magnitude only) — breakout 전략 본성과 매치
+RANKING_METHOD = "sharpe"           # "bayes_stein" | "sharpe"
+LOOKBACK_DAYS = 504                 # 252 (52주 high) | 504 (ATH)
+RISK_FREE_RATE = 0.035              # 한국 국고채 ~3.5% (Sharpe 계산용)
 
 BUY_COMMISSION = 0.00015            # 매수 수수료 0.015%
 SELL_COMMISSION = 0.00015           # 매도 수수료 0.015%
@@ -102,18 +108,46 @@ def load_ohlcv(conn, product_ids: List[int],
     return pd.read_sql(q, conn, parse_dates=["trade_date"])
 
 
-def load_expected_returns(conn, product_ids: List[int]) -> pd.DataFrame:
-    ids = ",".join(str(pid) for pid in product_ids)
-    q = f"""
-        SELECT product_id, snapshot_date, annual_expected_return::float AS er
-        FROM expected_returns_snapshot
-        WHERE product_id IN ({ids})
-          AND estimation_method = %s
-          AND annual_expected_return IS NOT NULL
-        ORDER BY product_id, snapshot_date
+def load_expected_returns(conn, product_ids: List[int],
+                          method: str = RANKING_METHOD,
+                          lookback: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    """랭킹 metric 로드. method='bayes_stein' 또는 'sharpe'.
+
+    - bayes_stein: expected_returns_snapshot.annual_expected_return
+                   estimation_method='bayes_stein' 필터
+    - sharpe: daily_returns_snapshot에서 (annual_mean_return - rf) / annual_volatility
+              개별 종목 historical 변동성 기반 (LW 공분산 X)
+
+    lookback 일치 필수 (252 또는 504).
     """
-    return pd.read_sql(q, conn, params=(ESTIMATION_METHOD,),
-                       parse_dates=["snapshot_date"])
+    ids = ",".join(str(pid) for pid in product_ids)
+    if method == "bayes_stein":
+        q = f"""
+            SELECT product_id, snapshot_date,
+                   annual_expected_return::float AS er
+            FROM expected_returns_snapshot
+            WHERE product_id IN ({ids})
+              AND estimation_method = 'bayes_stein'
+              AND lookback_days = {lookback}
+              AND annual_expected_return IS NOT NULL
+            ORDER BY product_id, snapshot_date
+        """
+    elif method == "sharpe":
+        q = f"""
+            SELECT product_id, snapshot_date,
+                   ((annual_mean_return - {RISK_FREE_RATE}) /
+                    NULLIF(annual_volatility, 0))::float AS er
+            FROM daily_returns_snapshot
+            WHERE product_id IN ({ids})
+              AND lookback_days = {lookback}
+              AND annual_mean_return IS NOT NULL
+              AND annual_volatility > 0
+            ORDER BY product_id, snapshot_date
+        """
+    else:
+        raise ValueError(f"Unknown ranking method: {method!r}. "
+                         f"Use 'bayes_stein' or 'sharpe'.")
+    return pd.read_sql(q, conn, parse_dates=["snapshot_date"])
 
 
 # ── Signal Detection ───────────────────────────────────────────
@@ -591,8 +625,10 @@ def print_stats(stats: dict, label: str = ""):
 
 # ── Reusable: data loading + simulation ───────────────────────
 
-def load_all_data(end_d: Optional[date] = None, verbose: bool = True) -> dict:
-    """DB에서 universe/OHLCV/expected_returns 로드 → ticker_data, bar_lookup, er_lookup, calendar"""
+def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
+                  ranking_method: str = RANKING_METHOD,
+                  lookback: int = LOOKBACK_DAYS) -> dict:
+    """DB에서 universe/OHLCV/ranking metric 로드 → ticker_data, bar_lookup, er_lookup, calendar"""
     if verbose:
         print("\n[데이터 로딩]")
     with connect() as conn:
@@ -606,8 +642,12 @@ def load_all_data(end_d: Optional[date] = None, verbose: bool = True) -> dict:
         ohlcv = load_ohlcv(conn, pids, end_date=end_d)
         if verbose: print(f"    {len(ohlcv):,} bars")
 
-        if verbose: print("  - Bayes-Stein 기대수익률...")
-        er_df = load_expected_returns(conn, pids)
+        if verbose:
+            label = "Bayes-Stein 기대수익률" if ranking_method == "bayes_stein" \
+                    else "Sharpe ratio (historical)"
+            print(f"  - {label} (lookback={lookback}일)...")
+        er_df = load_expected_returns(conn, pids,
+                                      method=ranking_method, lookback=lookback)
         if verbose: print(f"    {len(er_df):,} rows")
 
     if verbose: print("  - 종목별 분할 + bar lookup...")
@@ -710,6 +750,12 @@ def main():
                         help="SL 비활성, 본전 회복 시 청산 (BE 모드)")
     parser.add_argument("--slot-fraction", type=float, default=SLOT_FRACTION,
                         help="슬롯 크기 (총자산 대비 비율). 0=legacy cash/N. 권장 0.10")
+    parser.add_argument("--ranking", type=str, default=RANKING_METHOD,
+                        choices=["bayes_stein", "sharpe"],
+                        help=f"랭킹 metric (기본 {RANKING_METHOD})")
+    parser.add_argument("--lookback", type=int, default=LOOKBACK_DAYS,
+                        choices=[252, 504],
+                        help=f"ER/Sharpe lookback (기본 {LOOKBACK_DAYS})")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--yearly", action="store_true", help="연도별 breakdown 출력")
     args = parser.parse_args()
@@ -718,18 +764,22 @@ def main():
     end_d = datetime.strptime(args.end, "%Y-%m-%d").date() if args.end else None
 
     print("=" * 70)
-    print("  ATH 돌파 + 거래량 필터 + Bayes-Stein TopN — 한국 주식")
+    print("  ATH 돌파 + 거래량 필터 + Ranking TopN — 한국 주식")
     sl_label = "BE(no SL)" if args.no_sl else f"SL=-{args.sl_pct*100:.0f}%"
     sizing_label = (f"slot={args.slot_fraction*100:.0f}% of equity"
                     if args.slot_fraction > 0 else "cash/N (legacy)")
     print(f"  TP=+{args.tp_pct*100:.0f}% / {sl_label} | "
           f"ATH×{args.ath_ratio} | Vol×{args.vol_ratio} | "
           f"min_TV={args.min_tv:,.0f} | Top {args.top_n}")
-    print(f"  Sizing: {sizing_label} | 자본: {INITIAL_CAPITAL:,.0f}원")
+    print(f"  Sizing: {sizing_label} | "
+          f"Ranking: {args.ranking} (lookback={args.lookback}일) | "
+          f"자본: {INITIAL_CAPITAL:,.0f}원")
     print("=" * 70)
 
     t0 = time.time()
-    loaded = load_all_data(end_d=end_d, verbose=True)
+    loaded = load_all_data(end_d=end_d, verbose=True,
+                           ranking_method=args.ranking,
+                           lookback=args.lookback)
 
     print("\n[시뮬레이션]")
     sim, stats = run_with_params(
