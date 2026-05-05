@@ -57,6 +57,8 @@ VOLUME_RATIO = 3.0                  # 거래량 배율 (CLI override 가능)
 MIN_TRADING_VALUE = 0.0             # 20일 평균 거래대금 하한 (KRW). 0 = 필터 없음
 TV_LOOKBACK_DAYS = 20               # 거래대금 이동평균 기간
 SLOT_FRACTION = 0.0                 # 0 = legacy (cash/N 균등). >0 = 총자산 대비 슬롯 비중
+ENTRY_TIMING = "avg_close_open"     # next_open | next_close | same_close | avg_close_open
+                                    # avg_close_open: (D+0 close + D+1 open)/2 — 시간외종가 + 시초가 50/50 split
 MIN_HISTORY_DAYS = 252              # 최소 데이터 일수 (허위신호 방지)
 KR_CURRENCY = "KRW"
 
@@ -359,9 +361,18 @@ class DailySnap:
 
 
 class Simulator:
+    VALID_ENTRY_TIMINGS = ("next_open", "next_close", "same_close", "avg_close_open")
+
     def __init__(self, initial_capital: float = INITIAL_CAPITAL, verbose: bool = False,
                  tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
-                 no_sl: bool = False, slot_fraction: float = SLOT_FRACTION):
+                 no_sl: bool = False, slot_fraction: float = SLOT_FRACTION,
+                 entry_timing: str = ENTRY_TIMING):
+        """entry_timing:
+        - 'next_open':       D+1 시가
+        - 'next_close':      D+1 종가
+        - 'same_close':      D+0 신호일 종가 (시간외종가 매매 시뮬)
+        - 'avg_close_open':  (D+0 close + D+1 open) / 2 (50/50 split, baseline)
+        """
         self.initial_capital = initial_capital
         self.cash = initial_capital
         self.positions: Dict[str, Position] = {}
@@ -372,6 +383,54 @@ class Simulator:
         self.sl_pct = sl_pct
         self.no_sl = no_sl
         self.slot_fraction = slot_fraction
+        if entry_timing not in self.VALID_ENTRY_TIMINGS:
+            raise ValueError(
+                f"entry_timing must be one of {self.VALID_ENTRY_TIMINGS}, "
+                f"got {entry_timing!r}"
+            )
+        self.entry_timing = entry_timing
+
+    def _execute_entries(self, candidates: List[str],
+                         today: date, entry_prices: Dict[str, float],
+                         last_close: dict) -> int:
+        """슬롯 사이징 + 실제 진입. entry_prices = {ticker: 진입가}."""
+        if not candidates or self.cash <= 0:
+            return 0
+
+        if self.slot_fraction > 0:
+            positions_value = sum(
+                p.shares * last_close.get(t, p.entry_price)
+                for t, p in self.positions.items()
+            )
+            total_equity = self.cash + positions_value
+            slot_size = total_equity * self.slot_fraction
+        else:
+            slot_size = self.cash / len(candidates)
+
+        n_entries = 0
+        for tkr in candidates:
+            if self.cash <= 0:
+                break
+            alloc = min(slot_size, self.cash)
+            op = entry_prices[tkr]
+            shares = int(alloc / (op * (1 + BUY_COMMISSION)))
+            if shares <= 0:
+                continue
+            cost = shares * op * (1 + BUY_COMMISSION)
+            if cost > self.cash:
+                shares = int(self.cash / (op * (1 + BUY_COMMISSION)))
+                if shares <= 0:
+                    continue
+                cost = shares * op * (1 + BUY_COMMISSION)
+            self.cash -= cost
+            self.positions[tkr] = Position(
+                ticker=tkr, entry_date=today,
+                entry_price=op, shares=shares, entry_cost=cost,
+                tp_pct=self.tp_pct, sl_pct=self.sl_pct,
+                no_sl=self.no_sl,
+            )
+            n_entries += 1
+        return n_entries
 
     def run(self, calendar: List[date],
             ranked_signals: Dict[date, List[str]],
@@ -401,59 +460,61 @@ class Simulator:
             for t in closed:
                 del self.positions[t]
 
-            # 2) 전일 신호 → 당일 시가 진입 (top N from ranking)
-            if pending:
-                # 보유 중인 종목 제외, 시가 데이터 없는 종목 제외
-                candidates = [
-                    t for t in pending
-                    if t not in self.positions
-                    and bar_lookup.get(t, {}).get(today) is not None
-                    and bar_lookup[t][today]["open"] > 0
-                ]
-                if candidates and self.cash > 0:
-                    if self.slot_fraction > 0:
-                        # Fixed slot: 각 신규 진입 = 총자산 × slot_fraction
-                        # 총자산 = cash + 보유 포지션 mark-to-market (전일 종가)
-                        positions_value = sum(
-                            p.shares * last_close.get(t, p.entry_price)
-                            for t, p in self.positions.items()
-                        )
-                        total_equity = self.cash + positions_value
-                        slot_size = total_equity * self.slot_fraction
-                    else:
-                        # Legacy: cash/n_candidates 균등 분배
-                        slot_size = self.cash / len(candidates)
-
-                    for tkr in candidates:
-                        if self.cash <= 0:
-                            break
-                        alloc = min(slot_size, self.cash)
-                        bar = bar_lookup[tkr][today]
-                        op = bar["open"]
-                        shares = int(alloc / (op * (1 + BUY_COMMISSION)))
-                        if shares <= 0:
-                            continue
-                        cost = shares * op * (1 + BUY_COMMISSION)
-                        # 안전망: 잔여 cash 초과 방지
-                        if cost > self.cash:
-                            shares = int(self.cash / (op * (1 + BUY_COMMISSION)))
-                            if shares <= 0:
-                                continue
-                            cost = shares * op * (1 + BUY_COMMISSION)
-                        self.cash -= cost
-                        self.positions[tkr] = Position(
-                            ticker=tkr, entry_date=today,
-                            entry_price=op, shares=shares, entry_cost=cost,
-                            tp_pct=self.tp_pct, sl_pct=self.sl_pct,
-                            no_sl=self.no_sl,
-                        )
-                        n_entries += 1
+            # 2) 전일 pending → 당일 진입 (next_open / next_close / avg_close_open)
+            if pending and self.entry_timing in ("next_open", "next_close", "avg_close_open"):
+                if self.entry_timing == "next_open":
+                    candidates = [
+                        t for t in pending
+                        if t not in self.positions
+                        and bar_lookup.get(t, {}).get(today) is not None
+                        and bar_lookup[t][today]["open"] > 0
+                    ]
+                    entry_prices = {t: bar_lookup[t][today]["open"] for t in candidates}
+                elif self.entry_timing == "next_close":
+                    candidates = [
+                        t for t in pending
+                        if t not in self.positions
+                        and bar_lookup.get(t, {}).get(today) is not None
+                        and bar_lookup[t][today]["close"] > 0
+                    ]
+                    entry_prices = {t: bar_lookup[t][today]["close"] for t in candidates}
+                else:  # avg_close_open
+                    yesterday = calendar[i - 1] if i >= 1 else None
+                    candidates = [
+                        t for t in pending
+                        if t not in self.positions
+                        and yesterday is not None
+                        and bar_lookup.get(t, {}).get(yesterday) is not None
+                        and bar_lookup.get(t, {}).get(today) is not None
+                        and bar_lookup[t][yesterday]["close"] > 0
+                        and bar_lookup[t][today]["open"] > 0
+                    ]
+                    entry_prices = {
+                        t: (bar_lookup[t][yesterday]["close"] + bar_lookup[t][today]["open"]) / 2
+                        for t in candidates
+                    }
+                n_entries += self._execute_entries(
+                    candidates, today, entry_prices, last_close
+                )
                 pending = []
 
-            # 3) 당일 종가 기준 신호 → 익일 진입 대기 (이미 보유 중인 종목 제외)
+            # 3) 당일 종가 기준 신호 → same_close: 즉시 진입 / 그 외: 익일 대기
             today_signals = ranked_signals.get(today, [])
             if today_signals:
-                pending = [t for t in today_signals if t not in self.positions]
+                if self.entry_timing == "same_close":
+                    # 시간외종가 매매 시뮬: 신호 검출 즉시 당일 종가로 진입
+                    candidates = [
+                        t for t in today_signals
+                        if t not in self.positions
+                        and bar_lookup.get(t, {}).get(today) is not None
+                        and bar_lookup[t][today]["close"] > 0
+                    ]
+                    entry_prices = {t: bar_lookup[t][today]["close"] for t in candidates}
+                    n_entries += self._execute_entries(
+                        candidates, today, entry_prices, last_close
+                    )
+                else:
+                    pending = [t for t in today_signals if t not in self.positions]
 
             # 4) 일별 스냅샷 (adj_close 기준 평가)
             pos_value = 0.0
@@ -692,6 +753,7 @@ def run_with_params(loaded: dict, *,
                     sl_pct: float = SL_PCT,
                     no_sl: bool = False,
                     slot_fraction: float = SLOT_FRACTION,
+                    entry_timing: str = ENTRY_TIMING,
                     initial_capital: float = INITIAL_CAPITAL,
                     start_d: Optional[date] = None,
                     end_d: Optional[date] = None,
@@ -722,7 +784,8 @@ def run_with_params(loaded: dict, *,
 
     sim = Simulator(initial_capital=initial_capital, verbose=verbose,
                     tp_pct=tp_pct, sl_pct=sl_pct, no_sl=no_sl,
-                    slot_fraction=slot_fraction)
+                    slot_fraction=slot_fraction,
+                    entry_timing=entry_timing)
     sim.run(cal, ranked, bar_lookup)
     stats = compute_stats(sim)
     return sim, stats
@@ -756,6 +819,14 @@ def main():
     parser.add_argument("--lookback", type=int, default=LOOKBACK_DAYS,
                         choices=[252, 504],
                         help=f"ER/Sharpe lookback (기본 {LOOKBACK_DAYS})")
+    parser.add_argument("--entry-timing", type=str, default=ENTRY_TIMING,
+                        choices=["next_open", "next_close", "same_close",
+                                 "avg_close_open"],
+                        help=f"진입 타이밍 (기본 {ENTRY_TIMING}): "
+                             "next_open=D+1 시가, "
+                             "next_close=D+1 종가, "
+                             "same_close=D+0 종가 (시간외종가), "
+                             "avg_close_open=(D+0 close + D+1 open)/2 (50/50 split)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--yearly", action="store_true", help="연도별 breakdown 출력")
     args = parser.parse_args()
@@ -773,6 +844,7 @@ def main():
           f"min_TV={args.min_tv:,.0f} | Top {args.top_n}")
     print(f"  Sizing: {sizing_label} | "
           f"Ranking: {args.ranking} (lookback={args.lookback}일) | "
+          f"Entry: {args.entry_timing} | "
           f"자본: {INITIAL_CAPITAL:,.0f}원")
     print("=" * 70)
 
@@ -789,6 +861,7 @@ def main():
         tp_pct=args.tp_pct, sl_pct=args.sl_pct,
         no_sl=args.no_sl,
         slot_fraction=args.slot_fraction,
+        entry_timing=args.entry_timing,
         initial_capital=INITIAL_CAPITAL,
         start_d=start_d, end_d=end_d,
         verbose=args.verbose,
