@@ -81,13 +81,29 @@ def connect():
     return psycopg2.connect(**DB_CONFIG)
 
 
-def load_kr_universe(conn) -> pd.DataFrame:
-    q = """
-        SELECT product_id, ticker, name, market
-        FROM products
-        WHERE currency = %s
-        ORDER BY product_id
+def load_kr_universe(conn, apply_quality_filter: bool = True) -> pd.DataFrame:
+    """KR universe 로드.
+
+    apply_quality_filter=True (기본): asset_quality.is_selected=TRUE 종목만.
+        — 운영 플랫폼의 quality 필터와 일치 (거래일수/유동성/이상치 제거).
+    apply_quality_filter=False: products.currency='KRW' 전체.
     """
+    if apply_quality_filter:
+        q = """
+            SELECT p.product_id, p.ticker, p.name, p.market
+            FROM products p
+            JOIN asset_quality aq ON aq.product_id = p.product_id
+            WHERE p.currency = %s
+              AND aq.is_selected = TRUE
+            ORDER BY p.product_id
+        """
+    else:
+        q = """
+            SELECT product_id, ticker, name, market
+            FROM products
+            WHERE currency = %s
+            ORDER BY product_id
+        """
     return pd.read_sql(q, conn, params=(KR_CURRENCY,))
 
 
@@ -688,14 +704,17 @@ def print_stats(stats: dict, label: str = ""):
 
 def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
                   ranking_method: str = RANKING_METHOD,
-                  lookback: int = LOOKBACK_DAYS) -> dict:
+                  lookback: int = LOOKBACK_DAYS,
+                  apply_quality_filter: bool = True) -> dict:
     """DB에서 universe/OHLCV/ranking metric 로드 → ticker_data, bar_lookup, er_lookup, calendar"""
     if verbose:
         print("\n[데이터 로딩]")
     with connect() as conn:
         if verbose: print("  - KR universe...")
-        universe = load_kr_universe(conn)
-        if verbose: print(f"    KR 종목 (currency=KRW): {len(universe):,}")
+        universe = load_kr_universe(conn, apply_quality_filter=apply_quality_filter)
+        filter_label = "is_selected=TRUE" if apply_quality_filter else "no filter"
+        if verbose:
+            print(f"    KR 종목 (currency=KRW, {filter_label}): {len(universe):,}")
         ticker_map = dict(zip(universe["product_id"], universe["ticker"]))
         pids = universe["product_id"].tolist()
 
@@ -827,6 +846,8 @@ def main():
                              "next_close=D+1 종가, "
                              "same_close=D+0 종가 (시간외종가), "
                              "avg_close_open=(D+0 close + D+1 open)/2 (50/50 split)")
+    parser.add_argument("--no-quality-filter", action="store_true",
+                        help="asset_quality.is_selected=TRUE 필터 끄기 (기본은 ON)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--yearly", action="store_true", help="연도별 breakdown 출력")
     args = parser.parse_args()
@@ -851,7 +872,8 @@ def main():
     t0 = time.time()
     loaded = load_all_data(end_d=end_d, verbose=True,
                            ranking_method=args.ranking,
-                           lookback=args.lookback)
+                           lookback=args.lookback,
+                           apply_quality_filter=not args.no_quality_filter)
 
     print("\n[시뮬레이션]")
     sim, stats = run_with_params(
