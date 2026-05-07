@@ -3,3 +3,6 @@ __pycache__/
 results/
 sweep_*_results.csv
 sweep_results.csv
+last_run.log
+logs/
+*.sql.bak

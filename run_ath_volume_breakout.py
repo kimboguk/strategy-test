@@ -26,6 +26,7 @@ import argparse
 import os
 import sys
 import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -34,6 +35,9 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 import psycopg2
+
+# pandas read_sql warning suppression (psycopg2 connection 사용 시 발생)
+warnings.filterwarnings("ignore", category=UserWarning, module="pandas.io.sql")
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -48,26 +52,27 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "postgres"),
 }
 
-INITIAL_CAPITAL = 100_000_000      # 1억원
+# ── Baseline (운영 DB + asset_quality 필터 + 12년 백테스트 검증) ──
+# 변경 이력: 운영 DB가 BS만 사용하므로 ranking을 bayes_stein으로,
+# asset_quality 필터 ON 시 +164% Annual / -35% MDD / Calmar 4.70 (avg_close_open).
+
+INITIAL_CAPITAL = 100_000_000       # 1억원
 TP_PCT = 0.20                       # +20% 익절 (전량)
-SL_PCT = 0.05                       # -5% 손절 (전량)
+SL_PCT = 0.03                       # -3% 손절 (전량)
 TOP_N_PER_DAY = 3                   # 일별 진입 상한
-ATH_BREAKOUT_RATIO = 1.02           # 신고가 돌파 비율 (CLI override 가능)
-VOLUME_RATIO = 3.0                  # 거래량 배율 (CLI override 가능)
-MIN_TRADING_VALUE = 0.0             # 20일 평균 거래대금 하한 (KRW). 0 = 필터 없음
+ATH_BREAKOUT_RATIO = 1.02           # ATH × 1.02 돌파
+VOLUME_RATIO = 2.0                  # 거래량 ≥ 전일 × 2
+MIN_TRADING_VALUE = 1_000_000_000   # 20일 평균 거래대금 ≥ 10억 KRW
 TV_LOOKBACK_DAYS = 20               # 거래대금 이동평균 기간
-SLOT_FRACTION = 0.0                 # 0 = legacy (cash/N 균등). >0 = 총자산 대비 슬롯 비중
-ENTRY_TIMING = "avg_close_open"     # next_open | next_close | same_close | avg_close_open
-                                    # avg_close_open: (D+0 close + D+1 open)/2 — 시간외종가 + 시초가 50/50 split
+SLOT_FRACTION = 0.33                # 신규 진입 = 총자산 × 33% (~3종목 동시)
+ENTRY_TIMING = "avg_close_open"     # (D+0 close + D+1 open) / 2
 MIN_HISTORY_DAYS = 252              # 최소 데이터 일수 (허위신호 방지)
 KR_CURRENCY = "KRW"
 
-# ── Ranking method ─────────────────────────────────────────────
-# ATH-matched horizon: 504일 lookback이 ATH 신호와 정합
-# Sharpe (vol-adjusted) > Bayes-Stein (magnitude only) — breakout 전략 본성과 매치
-RANKING_METHOD = "sharpe"           # "bayes_stein" | "sharpe"
-LOOKBACK_DAYS = 504                 # 252 (52주 high) | 504 (ATH)
-RISK_FREE_RATE = 0.035              # 한국 국고채 ~3.5% (Sharpe 계산용)
+# ── Ranking ─────────────────────────────────────────────────────
+RANKING_METHOD = "bayes_stein"      # 운영 DB는 BS만 보유 — live 매칭
+LOOKBACK_DAYS = 504                 # ATH-horizon 매치 (252는 52주 high용)
+RISK_FREE_RATE = 0.035              # 한국 국고채 (Sharpe 계산용 — bayes_stein은 미사용)
 
 BUY_COMMISSION = 0.00015            # 매수 수수료 0.015%
 SELL_COMMISSION = 0.00015           # 매도 수수료 0.015%
