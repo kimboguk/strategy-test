@@ -86,12 +86,13 @@ def connect():
     return psycopg2.connect(**DB_CONFIG)
 
 
-def load_kr_universe(conn, apply_quality_filter: bool = True) -> pd.DataFrame:
-    """KR universe 로드.
+def load_universe(conn, currency: str = KR_CURRENCY,
+                  apply_quality_filter: bool = True) -> pd.DataFrame:
+    """주식 universe 로드 (currency 기준 — 다중시장 USD/KRW 지원).
 
     apply_quality_filter=True (기본): asset_quality.is_selected=TRUE 종목만.
         — 운영 플랫폼의 quality 필터와 일치 (거래일수/유동성/이상치 제거).
-    apply_quality_filter=False: products.currency='KRW' 전체.
+    apply_quality_filter=False: products.currency 전체.
     """
     if apply_quality_filter:
         q = """
@@ -109,7 +110,11 @@ def load_kr_universe(conn, apply_quality_filter: bool = True) -> pd.DataFrame:
             WHERE currency = %s
             ORDER BY product_id
         """
-    return pd.read_sql(q, conn, params=(KR_CURRENCY,))
+    return pd.read_sql(q, conn, params=(currency,))
+
+
+# 하위호환 alias — KR 전용 호출부(daily_signals.py 등)가 계속 동작
+load_kr_universe = load_universe
 
 
 def load_ohlcv(conn, product_ids: List[int],
@@ -122,6 +127,7 @@ def load_ohlcv(conn, product_ids: List[int],
         SELECT product_id, trade_date,
                open::float AS open, high::float AS high,
                low::float AS low, close::float AS close,
+               adj_close::float AS adj_close,
                COALESCE(volume, 0)::bigint AS volume
         FROM market_data
         WHERE {' AND '.join(where)}
@@ -134,14 +140,18 @@ def load_ohlcv(conn, product_ids: List[int],
 def load_expected_returns(conn, product_ids: List[int],
                           method: str = RANKING_METHOD,
                           lookback: int = LOOKBACK_DAYS) -> pd.DataFrame:
-    """랭킹 metric 로드. method='bayes_stein' 또는 'sharpe'.
+    """랭킹 metric 로드. method='bayes_stein' / 'sharpe' / 'expected_sharpe'.
 
-    - bayes_stein: expected_returns_snapshot.annual_expected_return
-                   estimation_method='bayes_stein' 필터
-    - sharpe: daily_returns_snapshot에서 (annual_mean_return - rf) / annual_volatility
-              개별 종목 historical 변동성 기반 (LW 공분산 X)
+    - bayes_stein: expected_returns_snapshot.annual_expected_return (BS shrunk ER)
+    - sharpe: daily_returns_snapshot에서
+              (annual_mean_return - rf) / annual_volatility
+              (분자/분모 모두 historical raw)
+    - expected_sharpe: BS shrunk ER / historical annual_volatility
+              분자: shrunk, 분모: historical raw vol
+              (운영 DB가 plain var이므로 raw vol과 동등)
+              ER snapshot JOIN daily_returns snapshot.
 
-    lookback 일치 필수 (252 또는 504).
+    lookback 일치 필수 — 분자/분모 모두 동일 lookback 사용 (기본 504).
     """
     ids = ",".join(str(pid) for pid in product_ids)
     if method == "bayes_stein":
@@ -167,9 +177,29 @@ def load_expected_returns(conn, product_ids: List[int],
               AND annual_volatility > 0
             ORDER BY product_id, snapshot_date
         """
+    elif method == "expected_sharpe":
+        # BS shrunk ER / historical volatility — 둘 다 같은 lookback
+        q = f"""
+            SELECT er.product_id, er.snapshot_date,
+                   ((er.annual_expected_return - {RISK_FREE_RATE}) /
+                    NULLIF(dr.annual_volatility, 0))::float AS er
+            FROM expected_returns_snapshot er
+            JOIN daily_returns_snapshot dr
+              ON er.product_id    = dr.product_id
+             AND er.snapshot_date = dr.snapshot_date
+             AND er.lookback_days = dr.lookback_days
+            WHERE er.product_id IN ({ids})
+              AND er.estimation_method = 'bayes_stein'
+              AND er.lookback_days = {lookback}
+              AND er.annual_expected_return IS NOT NULL
+              AND dr.annual_volatility > 0
+            ORDER BY er.product_id, er.snapshot_date
+        """
     else:
-        raise ValueError(f"Unknown ranking method: {method!r}. "
-                         f"Use 'bayes_stein' or 'sharpe'.")
+        raise ValueError(
+            f"Unknown ranking method: {method!r}. "
+            f"Use 'bayes_stein', 'sharpe', or 'expected_sharpe'."
+        )
     return pd.read_sql(q, conn, parse_dates=["snapshot_date"])
 
 
@@ -312,6 +342,8 @@ class Position:
     sl_price: float = 0.0
     no_sl: bool = False              # True면 SL 비활성, 본전 회복 시 청산
     has_been_underwater: bool = False  # entry 아래로 한 번이라도 내려갔는지
+    sell_commission: float = SELL_COMMISSION  # 시장별 비용 (스레드 안전: 전역 미사용)
+    sell_tax: float = SELL_TAX
 
     def __post_init__(self):
         self.tp_price = self.entry_price * (1 + self.tp_pct)
@@ -348,7 +380,7 @@ class Position:
 
     def _close(self, today: date, price: float, reason: str) -> Tuple[float, Trade]:
         gross = self.shares * price
-        sell_cost = gross * (SELL_COMMISSION + SELL_TAX)
+        sell_cost = gross * (self.sell_commission + self.sell_tax)
         net = gross - sell_cost
         pnl = net - self.entry_cost
         pnl_pct = (net / self.entry_cost - 1) * 100
@@ -387,12 +419,18 @@ class Simulator:
     def __init__(self, initial_capital: float = INITIAL_CAPITAL, verbose: bool = False,
                  tp_pct: float = TP_PCT, sl_pct: float = SL_PCT,
                  no_sl: bool = False, slot_fraction: float = SLOT_FRACTION,
-                 entry_timing: str = ENTRY_TIMING):
+                 entry_timing: str = ENTRY_TIMING,
+                 buy_commission: float = BUY_COMMISSION,
+                 sell_commission: float = SELL_COMMISSION,
+                 sell_tax: float = SELL_TAX):
         """entry_timing:
         - 'next_open':       D+1 시가
         - 'next_close':      D+1 종가
         - 'same_close':      D+0 신호일 종가 (시간외종가 매매 시뮬)
         - 'avg_close_open':  (D+0 close + D+1 open) / 2 (50/50 split, baseline)
+
+        buy/sell_commission, sell_tax: 시장별 거래비용 (Position에 스레딩 — 전역 미변경,
+        ThreadPool 동시 실행 안전).
         """
         self.initial_capital = initial_capital
         self.cash = initial_capital
@@ -404,6 +442,9 @@ class Simulator:
         self.sl_pct = sl_pct
         self.no_sl = no_sl
         self.slot_fraction = slot_fraction
+        self.buy_commission = buy_commission
+        self.sell_commission = sell_commission
+        self.sell_tax = sell_tax
         if entry_timing not in self.VALID_ENTRY_TIMINGS:
             raise ValueError(
                 f"entry_timing must be one of {self.VALID_ENTRY_TIMINGS}, "
@@ -434,21 +475,22 @@ class Simulator:
                 break
             alloc = min(slot_size, self.cash)
             op = entry_prices[tkr]
-            shares = int(alloc / (op * (1 + BUY_COMMISSION)))
+            shares = int(alloc / (op * (1 + self.buy_commission)))
             if shares <= 0:
                 continue
-            cost = shares * op * (1 + BUY_COMMISSION)
+            cost = shares * op * (1 + self.buy_commission)
             if cost > self.cash:
-                shares = int(self.cash / (op * (1 + BUY_COMMISSION)))
+                shares = int(self.cash / (op * (1 + self.buy_commission)))
                 if shares <= 0:
                     continue
-                cost = shares * op * (1 + BUY_COMMISSION)
+                cost = shares * op * (1 + self.buy_commission)
             self.cash -= cost
             self.positions[tkr] = Position(
                 ticker=tkr, entry_date=today,
                 entry_price=op, shares=shares, entry_cost=cost,
                 tp_pct=self.tp_pct, sl_pct=self.sl_pct,
                 no_sl=self.no_sl,
+                sell_commission=self.sell_commission, sell_tax=self.sell_tax,
             )
             n_entries += 1
         return n_entries
@@ -624,6 +666,84 @@ def compute_stats(sim: Simulator) -> dict:
     }
 
 
+def compute_risk_metrics(sim: Simulator) -> dict:
+    """일별 equity에서 Sharpe/Sortino/Calmar/연변동성 계산 (metrics/performance.py 수식)."""
+    snaps = sim.snaps
+    if len(snaps) < 2:
+        return {"sharpe_ratio": 0.0, "sortino_ratio": 0.0,
+                "calmar_ratio": 0.0, "ann_volatility_pct": 0.0}
+    eq = np.array([s.total_equity for s in snaps], dtype=float)
+    rets = eq[1:] / eq[:-1] - 1
+    valid = rets[~np.isnan(rets)]
+    TD = 252
+    vol = float(np.std(valid, ddof=1)) if len(valid) > 1 else 0.0
+    ann_vol = vol * np.sqrt(TD) * 100
+
+    rf_daily = (1 + RISK_FREE_RATE) ** (1 / TD) - 1
+    excess = valid - rf_daily
+    sharpe = float(np.mean(excess) / vol * np.sqrt(TD)) if vol > 0 else 0.0
+
+    downside = valid[valid < 0]
+    dstd = float(np.std(downside, ddof=1)) if len(downside) > 1 else 0.0
+    sortino = float(np.mean(excess) / dstd * np.sqrt(TD)) if dstd > 0 else 0.0
+
+    running_max = np.maximum.accumulate(eq)
+    mdd = float(((eq - running_max) / running_max).min())
+    n_years = len(eq) / TD
+    ann_return = (eq[-1] / sim.initial_capital) ** (1 / n_years) - 1 if n_years > 0 else 0.0
+    calmar = float(ann_return / abs(mdd)) if mdd != 0 else 0.0
+
+    return {"sharpe_ratio": sharpe, "sortino_ratio": sortino,
+            "calmar_ratio": calmar, "ann_volatility_pct": float(ann_vol)}
+
+
+def compute_yearly(sim: Simulator) -> List[dict]:
+    """연도별(청산 연도 기준) trade 통계 + 연말 자산/수익률/연내 MDD — dict 리스트."""
+    if not sim.trades:
+        return []
+    df = pd.DataFrame([t.__dict__ for t in sim.trades])
+    df["year"] = pd.to_datetime(df["exit_date"]).dt.year
+
+    snap_df = pd.DataFrame([{"date": s.date, "equity": s.total_equity} for s in sim.snaps])
+    snap_df["year"] = pd.to_datetime(snap_df["date"]).dt.year
+    year_end_eq = snap_df.groupby("year")["equity"].last()
+
+    yr_mdd: Dict[int, float] = {}
+    for yr, sub in snap_df.groupby("year"):
+        eq = sub["equity"].values
+        if len(eq) == 0:
+            yr_mdd[int(yr)] = 0.0
+            continue
+        rm = np.maximum.accumulate(eq)
+        yr_mdd[int(yr)] = float(((eq - rm) / rm).min() * 100)
+
+    out: List[dict] = []
+    prev_eoy = sim.initial_capital
+    for yr in sorted(df["year"].unique()):
+        sub = df[df["year"] == yr]
+        n = len(sub)
+        wins = sub[sub["pnl"] > 0]
+        losses = sub[sub["pnl"] <= 0]
+        wr = len(wins) / n * 100 if n else 0.0
+        gw = wins["pnl"].sum() if len(wins) else 0.0
+        gl = abs(losses["pnl"].sum()) if len(losses) else 0.0
+        pf = gw / gl if gl > 0 else float("inf")
+        avg_w = wins["pnl"].mean() if len(wins) else 0.0
+        avg_l = losses["pnl"].mean() if len(losses) else 0.0
+        rrr = abs(avg_w / avg_l) if avg_l < 0 else float("inf")
+        eoy = float(year_end_eq.get(yr, prev_eoy))
+        yr_ret = (eoy / prev_eoy - 1) * 100 if prev_eoy > 0 else 0.0
+        out.append({
+            "year": int(yr), "trades": int(n), "win_rate": float(wr),
+            "profit_factor": float(pf), "rrr": float(rrr),
+            "net_pnl": float(sub["pnl"].sum()), "eoy_equity": eoy,
+            "year_return_pct": float(yr_ret),
+            "year_mdd_pct": float(yr_mdd.get(int(yr), 0.0)),
+        })
+        prev_eoy = eoy
+    return out
+
+
 def print_yearly_breakdown(sim: Simulator):
     """청산기준 연도별 trade 통계 + 연말 자산 스냅샷"""
     if not sim.trades:
@@ -710,16 +830,24 @@ def print_stats(stats: dict, label: str = ""):
 def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
                   ranking_method: str = RANKING_METHOD,
                   lookback: int = LOOKBACK_DAYS,
-                  apply_quality_filter: bool = True) -> dict:
-    """DB에서 universe/OHLCV/ranking metric 로드 → ticker_data, bar_lookup, er_lookup, calendar"""
+                  apply_quality_filter: bool = True,
+                  currency: str = KR_CURRENCY,
+                  price_mode: str = "raw") -> dict:
+    """DB에서 universe/OHLCV/ranking metric 로드 → ticker_data, bar_lookup, er_lookup, calendar
+
+    currency:   'KRW' / 'USD' (다중시장)
+    price_mode: 'raw' (원본 OHLC) / 'adjusted' (adj_close/close 팩터로 분할·배당 보정).
+                US=adjusted 권장(분할 가짜 신호 방지), KR=raw(adj 오염 → 큐레이션 종목은 adj==raw).
+    """
     if verbose:
         print("\n[데이터 로딩]")
     with connect() as conn:
-        if verbose: print("  - KR universe...")
-        universe = load_kr_universe(conn, apply_quality_filter=apply_quality_filter)
+        if verbose: print(f"  - universe (currency={currency})...")
+        universe = load_universe(conn, currency=currency,
+                                 apply_quality_filter=apply_quality_filter)
         filter_label = "is_selected=TRUE" if apply_quality_filter else "no filter"
         if verbose:
-            print(f"    KR 종목 (currency=KRW, {filter_label}): {len(universe):,}")
+            print(f"    종목 (currency={currency}, {filter_label}): {len(universe):,}")
         ticker_map = dict(zip(universe["product_id"], universe["ticker"]))
         pids = universe["product_id"].tolist()
 
@@ -728,8 +856,12 @@ def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
         if verbose: print(f"    {len(ohlcv):,} bars")
 
         if verbose:
-            label = "Bayes-Stein 기대수익률" if ranking_method == "bayes_stein" \
-                    else "Sharpe ratio (historical)"
+            label_map = {
+                "bayes_stein": "Bayes-Stein 기대수익률",
+                "sharpe": "Sharpe ratio (historical)",
+                "expected_sharpe": "Expected Sharpe (BS_ER / hist_vol)",
+            }
+            label = label_map.get(ranking_method, ranking_method)
             print(f"  - {label} (lookback={lookback}일)...")
         er_df = load_expected_returns(conn, pids,
                                       method=ranking_method, lookback=lookback)
@@ -738,11 +870,21 @@ def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
     if verbose: print("  - 종목별 분할 + bar lookup...")
     ticker_data: Dict[str, pd.DataFrame] = {}
     bar_lookup: Dict[str, Dict[date, dict]] = {}
+    n_adjusted = 0
     for pid, grp in ohlcv.groupby("product_id"):
         tkr = ticker_map.get(pid)
         if not tkr:
             continue
         df = grp.sort_values("trade_date").reset_index(drop=True)
+        if price_mode == "adjusted" and "adj_close" in df.columns:
+            # 수정주가 팩터로 OHLC 역조정 + volume 보정 (turnover = price×volume 보존)
+            valid = df["adj_close"].notna() & (df["adj_close"] > 0) & (df["close"] > 0)
+            factor = (df["adj_close"] / df["close"]).where(valid, 1.0)
+            if (factor != 1.0).any():
+                for col in ("open", "high", "low", "close"):
+                    df[col] = df[col] * factor
+                df["volume"] = (df["volume"] / factor).round()
+                n_adjusted += 1
         ticker_data[tkr] = df
         d_lookup = {}
         for row in df.itertuples(index=False):
@@ -755,7 +897,9 @@ def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
                 "volume": int(row.volume),
             }
         bar_lookup[tkr] = d_lookup
-    if verbose: print(f"    종목 수: {len(ticker_data):,}")
+    if verbose:
+        print(f"    종목 수: {len(ticker_data):,}"
+              + (f" (adjusted={n_adjusted:,})" if price_mode == "adjusted" else ""))
 
     full_dates = sorted({d for lkp in bar_lookup.values() for d in lkp.keys()})
     er_lookup = build_er_lookup(er_df, ticker_map)
@@ -779,6 +923,9 @@ def run_with_params(loaded: dict, *,
                     slot_fraction: float = SLOT_FRACTION,
                     entry_timing: str = ENTRY_TIMING,
                     initial_capital: float = INITIAL_CAPITAL,
+                    buy_commission: float = BUY_COMMISSION,
+                    sell_commission: float = SELL_COMMISSION,
+                    sell_tax: float = SELL_TAX,
                     start_d: Optional[date] = None,
                     end_d: Optional[date] = None,
                     verbose: bool = False,
@@ -809,7 +956,9 @@ def run_with_params(loaded: dict, *,
     sim = Simulator(initial_capital=initial_capital, verbose=verbose,
                     tp_pct=tp_pct, sl_pct=sl_pct, no_sl=no_sl,
                     slot_fraction=slot_fraction,
-                    entry_timing=entry_timing)
+                    entry_timing=entry_timing,
+                    buy_commission=buy_commission,
+                    sell_commission=sell_commission, sell_tax=sell_tax)
     sim.run(cal, ranked, bar_lookup)
     stats = compute_stats(sim)
     return sim, stats
@@ -838,8 +987,9 @@ def main():
     parser.add_argument("--slot-fraction", type=float, default=SLOT_FRACTION,
                         help="슬롯 크기 (총자산 대비 비율). 0=legacy cash/N. 권장 0.10")
     parser.add_argument("--ranking", type=str, default=RANKING_METHOD,
-                        choices=["bayes_stein", "sharpe"],
-                        help=f"랭킹 metric (기본 {RANKING_METHOD})")
+                        choices=["bayes_stein", "sharpe", "expected_sharpe"],
+                        help=f"랭킹 metric (기본 {RANKING_METHOD}). "
+                             "expected_sharpe = BS shrunk ER / historical vol")
     parser.add_argument("--lookback", type=int, default=LOOKBACK_DAYS,
                         choices=[252, 504],
                         help=f"ER/Sharpe lookback (기본 {LOOKBACK_DAYS})")
@@ -853,6 +1003,11 @@ def main():
                              "avg_close_open=(D+0 close + D+1 open)/2 (50/50 split)")
     parser.add_argument("--no-quality-filter", action="store_true",
                         help="asset_quality.is_selected=TRUE 필터 끄기 (기본은 ON)")
+    parser.add_argument("--currency", type=str, default=KR_CURRENCY,
+                        help=f"유니버스 통화 (기본 {KR_CURRENCY}). USD=미국, KRW=한국")
+    parser.add_argument("--price-mode", type=str, default="raw",
+                        choices=["raw", "adjusted"],
+                        help="raw=원본 OHLC(기본, KR), adjusted=수정주가 보정(US 권장)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--yearly", action="store_true", help="연도별 breakdown 출력")
     args = parser.parse_args()
@@ -878,7 +1033,9 @@ def main():
     loaded = load_all_data(end_d=end_d, verbose=True,
                            ranking_method=args.ranking,
                            lookback=args.lookback,
-                           apply_quality_filter=not args.no_quality_filter)
+                           apply_quality_filter=not args.no_quality_filter,
+                           currency=args.currency,
+                           price_mode=args.price_mode)
 
     print("\n[시뮬레이션]")
     sim, stats = run_with_params(
