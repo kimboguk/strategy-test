@@ -139,28 +139,29 @@ def load_ohlcv(conn, product_ids: List[int],
 
 def load_expected_returns(conn, product_ids: List[int],
                           method: str = RANKING_METHOD,
-                          lookback: int = LOOKBACK_DAYS) -> pd.DataFrame:
+                          lookback: int = LOOKBACK_DAYS,
+                          source: str = "bt") -> pd.DataFrame:
     """랭킹 metric 로드. method='bayes_stein' / 'sharpe' / 'expected_sharpe'.
 
-    - bayes_stein: expected_returns_snapshot.annual_expected_return (BS shrunk ER)
-    - sharpe: daily_returns_snapshot에서
-              (annual_mean_return - rf) / annual_volatility
-              (분자/분모 모두 historical raw)
-    - expected_sharpe: BS shrunk ER / historical annual_volatility
-              분자: shrunk, 분모: historical raw vol
-              (운영 DB가 plain var이므로 raw vol과 동등)
-              ER snapshot JOIN daily_returns snapshot.
+    source='bt' (백테스트 historical) / 'rt' (실시간) — 정본 테이블 분리.
+      bt_expected_returns / bt_asset_metrics, rt_expected_returns / rt_asset_metrics.
+      (이미 product_id 부여 + bayes_stein 필터 적용된 로컬 미러)
 
-    lookback 일치 필수 — 분자/분모 모두 동일 lookback 사용 (기본 504).
+    - bayes_stein:   {src}_expected_returns.annual_expected_return (BS shrunk ER)
+    - sharpe:        {src}_asset_metrics 의 (annual_mean_return - rf) / annual_volatility
+    - expected_sharpe: BS shrunk ER / historical annual_volatility (ER JOIN metrics)
+
+    lookback 일치 필수 — 분자/분모 모두 동일 lookback 사용.
     """
+    er_tbl = f"{source}_expected_returns"
+    am_tbl = f"{source}_asset_metrics"
     ids = ",".join(str(pid) for pid in product_ids)
     if method == "bayes_stein":
         q = f"""
             SELECT product_id, snapshot_date,
                    annual_expected_return::float AS er
-            FROM expected_returns_snapshot
+            FROM {er_tbl}
             WHERE product_id IN ({ids})
-              AND estimation_method = 'bayes_stein'
               AND lookback_days = {lookback}
               AND annual_expected_return IS NOT NULL
             ORDER BY product_id, snapshot_date
@@ -170,7 +171,7 @@ def load_expected_returns(conn, product_ids: List[int],
             SELECT product_id, snapshot_date,
                    ((annual_mean_return - {RISK_FREE_RATE}) /
                     NULLIF(annual_volatility, 0))::float AS er
-            FROM daily_returns_snapshot
+            FROM {am_tbl}
             WHERE product_id IN ({ids})
               AND lookback_days = {lookback}
               AND annual_mean_return IS NOT NULL
@@ -183,13 +184,12 @@ def load_expected_returns(conn, product_ids: List[int],
             SELECT er.product_id, er.snapshot_date,
                    ((er.annual_expected_return - {RISK_FREE_RATE}) /
                     NULLIF(dr.annual_volatility, 0))::float AS er
-            FROM expected_returns_snapshot er
-            JOIN daily_returns_snapshot dr
+            FROM {er_tbl} er
+            JOIN {am_tbl} dr
               ON er.product_id    = dr.product_id
              AND er.snapshot_date = dr.snapshot_date
              AND er.lookback_days = dr.lookback_days
             WHERE er.product_id IN ({ids})
-              AND er.estimation_method = 'bayes_stein'
               AND er.lookback_days = {lookback}
               AND er.annual_expected_return IS NOT NULL
               AND dr.annual_volatility > 0
@@ -832,7 +832,8 @@ def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
                   lookback: int = LOOKBACK_DAYS,
                   apply_quality_filter: bool = True,
                   currency: str = KR_CURRENCY,
-                  price_mode: str = "raw") -> dict:
+                  price_mode: str = "raw",
+                  source: str = "bt") -> dict:
     """DB에서 universe/OHLCV/ranking metric 로드 → ticker_data, bar_lookup, er_lookup, calendar
 
     currency:   'KRW' / 'USD' (다중시장)
@@ -864,7 +865,8 @@ def load_all_data(end_d: Optional[date] = None, verbose: bool = True,
             label = label_map.get(ranking_method, ranking_method)
             print(f"  - {label} (lookback={lookback}일)...")
         er_df = load_expected_returns(conn, pids,
-                                      method=ranking_method, lookback=lookback)
+                                      method=ranking_method, lookback=lookback,
+                                      source=source)
         if verbose: print(f"    {len(er_df):,} rows")
 
     if verbose: print("  - 종목별 분할 + bar lookup...")

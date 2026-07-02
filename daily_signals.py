@@ -299,7 +299,8 @@ def detect_today_signals(today: date) -> Tuple[List[dict], dict]:
         # ER lookup
         er_df = load_expected_returns(conn, pids,
                                       method=RANKING_METHOD,
-                                      lookback=LOOKBACK_DAYS)
+                                      lookback=LOOKBACK_DAYS,
+                                      source="rt")
         er_lookup = build_er_lookup(er_df, ticker_map)
 
     # ticker별 signal 검출 (오늘만 관심)
