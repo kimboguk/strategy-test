@@ -9,7 +9,7 @@
   python daily_signals.py [--as-of YYYY-MM-DD]
 
 흐름 (오늘 = today):
-  1) 가상 자본 초기화 (forward_capital이 비어있으면 INITIAL_CAPITAL로 시작)
+  1) 가상 자본 초기화 (forward_capital이 비어있으면 FORWARD_INITIAL_CAPITAL로 시작)
   2) Pending 포지션 처리 — D+1 entry price 확정 (avg_close_open: yesterday close + today open / 2)
   3) Open 포지션 TP/SL 체크 — 오늘 high/low 기반
   4) 오늘 종가 기준 신호 검출 → top-N 산출 (baseline 파라미터)
@@ -38,7 +38,6 @@ if sys.platform == "win32":
 # baseline 파라미터/유틸 재사용
 from run_ath_volume_breakout import (
     DB_CONFIG,
-    INITIAL_CAPITAL,
     TP_PCT, SL_PCT,
     SLOT_FRACTION,
     ATH_BREAKOUT_RATIO, VOLUME_RATIO,
@@ -51,6 +50,10 @@ from run_ath_volume_breakout import (
     detect_signals_per_ticker,
     build_er_lookup, lookup_er_asof,
 )
+
+# forward 모의 장부 초기자본 — 백테스트 공유 상수(INITIAL_CAPITAL=1억)와 분리.
+# 실거래 기준선이므로 실제 투입 예정 금액(1,000만원)으로 추적.
+FORWARD_INITIAL_CAPITAL = 10_000_000
 
 
 # ── DB connection ──────────────────────────────────────────────
@@ -75,7 +78,7 @@ def get_or_init_capital(cur, today: date) -> Tuple[float, float, float]:
     if row:
         return float(row[0]), float(row[1]), float(row[2])
     # 첫 실행
-    return float(INITIAL_CAPITAL), 0.0, float(INITIAL_CAPITAL)
+    return float(FORWARD_INITIAL_CAPITAL), 0.0, float(FORWARD_INITIAL_CAPITAL)
 
 
 # ── 2) Pending → Open: entry_price 확정 ────────────────────────
@@ -414,16 +417,23 @@ def record_signals(cur, today: date, picks: List[dict], meta: dict,
 
 def update_capital_snapshot(cur, today: date, cash: float,
                             n_entries: int, n_exits: int):
-    # 보유 포지션 mark-to-market
+    # ── 상태 기반(멱등) 재계산 ──
+    # 전달받은 cash/n_entries/n_exits(증분값)는 무시하고 today 시점 원장에서 재계산.
+    # → 같은 날 사이클을 여러 번 재실행해도 실현손익이 소실되지 않음.
+    #
+    # today 시점 open = entry_date<=today AND (exit_date IS NULL OR exit_date>today)
     cur.execute("""
-        SELECT fp.id, fp.product_id, fp.shares, fp.cost_basis
+        SELECT fp.product_id, fp.shares, fp.cost_basis
         FROM forward_positions fp
-        WHERE fp.status='open'
-    """)
+        WHERE fp.entry_date IS NOT NULL AND fp.entry_date <= %s
+          AND (fp.exit_date IS NULL OR fp.exit_date > %s)
+    """, (today, today))
     pos_rows = cur.fetchall()
 
     positions_value = 0.0
-    for pos_id, pid, shares, _ in pos_rows:
+    open_cost = 0.0
+    for pid, shares, cost in pos_rows:
+        open_cost += float(cost) if cost is not None else 0.0
         cur.execute("""
             SELECT close FROM market_data
             WHERE product_id=%s AND trade_date<=%s
@@ -432,6 +442,18 @@ def update_capital_snapshot(cur, today: date, cash: float,
         r = cur.fetchone()
         if r and r[0]:
             positions_value += float(shares) * float(r[0])
+
+    # 실현손익 누적 (exit_date <= today) + 당일 진입/청산 건수 — 모두 상태 기반
+    cur.execute("""SELECT COALESCE(SUM(pnl_krw), 0) FROM forward_positions
+                   WHERE exit_date IS NOT NULL AND exit_date <= %s""", (today,))
+    realized = float(cur.fetchone()[0] or 0.0)
+    cur.execute("SELECT count(*) FROM forward_positions WHERE entry_date=%s", (today,))
+    n_entries = cur.fetchone()[0]
+    cur.execute("SELECT count(*) FROM forward_positions WHERE exit_date=%s", (today,))
+    n_exits = cur.fetchone()[0]
+
+    # 현금 = 초기자본 + 실현손익(청산분) − open 포지션 투입원가
+    cash = float(FORWARD_INITIAL_CAPITAL) + realized - open_cost
     total_equity = cash + positions_value
 
     # 전일 equity 조회 → 오늘 daily_pnl
@@ -440,10 +462,10 @@ def update_capital_snapshot(cur, today: date, cash: float,
         WHERE snapshot_date<%s ORDER BY snapshot_date DESC LIMIT 1
     """, (today,))
     prev = cur.fetchone()
-    prev_eq = float(prev[0]) if prev else float(INITIAL_CAPITAL)
+    prev_eq = float(prev[0]) if prev else float(FORWARD_INITIAL_CAPITAL)
     daily_pnl = total_equity - prev_eq
     daily_ret = (total_equity / prev_eq - 1) * 100 if prev_eq > 0 else 0.0
-    cum_ret = (total_equity / float(INITIAL_CAPITAL) - 1) * 100
+    cum_ret = (total_equity / float(FORWARD_INITIAL_CAPITAL) - 1) * 100
 
     cur.execute("""
         INSERT INTO forward_capital (
@@ -512,33 +534,26 @@ def print_report(today, picks, meta, entries, exits,
 
 # ── Main ────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--as-of", type=str, default=None,
-                        help="처리 기준일 (YYYY-MM-DD). 기본: 로컬 DB의 max(trade_date)")
-    args = parser.parse_args()
+def get_pending_trading_days(cur, upto: date) -> List[date]:
+    """forward_capital 마지막 스냅샷 다음 거래일 ~ upto 까지의 실제 거래일 목록.
 
-    # today 결정
-    with connect() as conn:
-        cur = conn.cursor()
-        if args.as_of:
-            today = datetime.strptime(args.as_of, "%Y-%m-%d").date()
-        else:
-            cur.execute("SELECT MAX(trade_date) FROM market_data")
-            today = cur.fetchone()[0]
-            if today is None:
-                print("market_data 비어있음. sync 먼저 실행.")
-                sys.exit(1)
+    스케줄러가 하루 걸러도 다음 실행에서 순서대로 메워지도록(갭 방지) 사용.
+    forward_capital 이 비어있으면(리셋 직후) 당일만 처리.
+    """
+    cur.execute("SELECT MAX(snapshot_date) FROM forward_capital")
+    last = cur.fetchone()[0]
+    if last is None:
+        return [upto]
+    cur.execute("""
+        SELECT DISTINCT trade_date FROM market_data
+        WHERE trade_date > %s AND trade_date <= %s
+        ORDER BY trade_date
+    """, (last, upto))
+    return [r[0] for r in cur.fetchall()]
 
-    print(f"\n=== Daily Signal Pipeline — as of {today} ===")
-    print(f"  baseline: ATH×{ATH_BREAKOUT_RATIO} Vol×{VOLUME_RATIO} "
-          f"min_TV={MIN_TRADING_VALUE/1e9:.0f}B Top{TOP_N_PER_DAY}")
-    print(f"  TP=+{TP_PCT*100:.0f}% SL=-{SL_PCT*100:.0f}% slot={SLOT_FRACTION*100:.0f}% "
-          f"entry={ENTRY_TIMING}")
-    print(f"  ranking={RANKING_METHOD}({LOOKBACK_DAYS}일) "
-          f"filter=is_selected=TRUE")
 
-    # === 모든 DB 작업은 단일 트랜잭션 ===
+def run_cycle(today: date):
+    """하루치 사이클 (단일 트랜잭션). 반환: 리포트 인자 묶음."""
     with connect() as conn:
         cur = conn.cursor()
 
@@ -563,15 +578,65 @@ def main():
         # 5) 신호 기록
         record_signals(cur, today, picks, meta, already_open)
 
-        # 6) 자본 스냅샷
-        total_equity, _, n_open, daily_ret, cum_ret = update_capital_snapshot(
+        # 6) 자본 스냅샷 (상태 기반 재계산 — 멱등)
+        total_equity, pos_value, n_open, daily_ret, cum_ret = update_capital_snapshot(
             cur, today, cash, n_entries, n_exits)
+        cash = total_equity - pos_value   # 스냅샷 정합 현금 (스레드값 대체)
 
         conn.commit()
 
-    # 7) 리포트
-    print_report(today, picks, meta, entries_log, exits_log,
-                 cash, total_equity, n_open, daily_ret, cum_ret)
+    return (picks, meta, entries_log, exits_log,
+            cash, total_equity, n_open, daily_ret, cum_ret)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--as-of", type=str, default=None,
+                        help="처리 기준일 (YYYY-MM-DD). 기본: 로컬 DB의 max(trade_date)")
+    parser.add_argument("--no-catchup", action="store_true",
+                        help="누락 거래일 백필 없이 당일만 처리")
+    args = parser.parse_args()
+
+    # 처리할 거래일 결정 (기본: 누락분 catch-up)
+    with connect() as conn:
+        cur = conn.cursor()
+        if args.as_of:
+            days = [datetime.strptime(args.as_of, "%Y-%m-%d").date()]
+        else:
+            cur.execute("SELECT MAX(trade_date) FROM market_data")
+            upto = cur.fetchone()[0]
+            if upto is None:
+                print("market_data 비어있음. sync 먼저 실행.")
+                sys.exit(1)
+            if args.no_catchup:
+                days = [upto]
+            else:
+                days = get_pending_trading_days(cur, upto)
+                if not days:
+                    print(f"이미 최신 ({upto}) — 처리할 거래일 없음.")
+                    return
+
+    print(f"\n=== Daily Signal Pipeline — {len(days)}개 거래일 "
+          f"({days[0]} ~ {days[-1]}) ===")
+    print(f"  baseline: ATH×{ATH_BREAKOUT_RATIO} Vol×{VOLUME_RATIO} "
+          f"min_TV={MIN_TRADING_VALUE/1e9:.0f}B Top{TOP_N_PER_DAY}")
+    print(f"  TP=+{TP_PCT*100:.0f}% SL=-{SL_PCT*100:.0f}% slot={SLOT_FRACTION*100:.0f}% "
+          f"entry={ENTRY_TIMING}")
+    print(f"  ranking={RANKING_METHOD}({LOOKBACK_DAYS}일) "
+          f"filter=is_selected=TRUE")
+    if len(days) > 10:
+        print(f"  ⚠ 백필 {len(days)}일 — 장기 미실행 구간을 메웁니다.")
+
+    # 거래일 순차 처리 (갭 없이 진행돼야 자본 회계가 정합)
+    for i, day in enumerate(days):
+        result = run_cycle(day)
+        if i < len(days) - 1:
+            _, _, _, _, _, eq, n_open, _, _ = result
+            print(f"  [백필 {i+1}/{len(days)}] {day} "
+                  f"equity={eq:,.0f} open={n_open}")
+
+    # 마지막 날 리포트
+    print_report(days[-1], *result)
 
 
 if __name__ == "__main__":

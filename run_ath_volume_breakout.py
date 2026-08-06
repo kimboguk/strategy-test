@@ -614,6 +614,26 @@ class Simulator:
 
 # ── Stats ──────────────────────────────────────────────────────
 
+def _active_start_idx(sim) -> int:
+    """첫 거래(진입) 개시 스냅샷 인덱스. 선행 무거래 평탄구간 제외용.
+
+    연환산 수익률/변동성/Sharpe 를 실제 자본이 투입된 구간 기준으로 계산하기 위함.
+    (예: KR 유니버스가 2013~2014 확대 전 무거래로 자본이 평탄한 구간이 CAGR 을 희석)
+    거래/스냅샷이 없으면 0.
+    """
+    if not sim.trades or not sim.snaps:
+        return 0
+
+    def _d(x):
+        return x.date() if hasattr(x, "date") else x
+
+    first = min(_d(t.entry_date) for t in sim.trades)
+    for i, s in enumerate(sim.snaps):
+        if _d(s.date) >= first:
+            return i
+    return 0
+
+
 def compute_stats(sim: Simulator) -> dict:
     trades = sim.trades
     n = len(trades)
@@ -637,13 +657,20 @@ def compute_stats(sim: Simulator) -> dict:
     final_equity = sim.snaps[-1].total_equity if sim.snaps else sim.initial_capital
     total_return = (final_equity / sim.initial_capital - 1) * 100
 
-    eq = np.array([s.total_equity for s in sim.snaps])
+    eq_full = np.array([s.total_equity for s in sim.snaps])
+    n_days = len(sim.snaps)
+
+    # 연환산/MDD 는 **실제 거래 개시일 이후** 구간 기준 (선행 무거래 평탄구간 제외).
+    i0 = _active_start_idx(sim)
+    eq = eq_full[i0:] if len(eq_full) > i0 else eq_full
+    active_days = len(eq)
+    active_start = sim.snaps[i0].date if sim.snaps else None
+
     running_max = np.maximum.accumulate(eq)
     dd = (eq - running_max) / running_max
     mdd = float(dd.min() * 100) if len(dd) else 0.0
 
-    n_days = len(sim.snaps)
-    n_years = n_days / 252 if n_days else 1
+    n_years = active_days / 252 if active_days else 1
     ann_return = ((final_equity / sim.initial_capital) ** (1 / n_years) - 1) * 100 \
                  if n_years > 0 else 0.0
 
@@ -663,6 +690,11 @@ def compute_stats(sim: Simulator) -> dict:
         "mdd_pct": mdd,
         "exit_reasons": by_reason,
         "avg_holding_days": float(df["holding_days"].mean()),
+        # 연환산 기준이 된 실제 거래 구간 (선행 무거래 구간 제외)
+        "active_start": str(active_start) if active_start else None,
+        "active_years": round(n_years, 2),
+        "active_trading_days": active_days,
+        "total_trading_days": n_days,
     }
 
 
@@ -672,7 +704,11 @@ def compute_risk_metrics(sim: Simulator) -> dict:
     if len(snaps) < 2:
         return {"sharpe_ratio": 0.0, "sortino_ratio": 0.0,
                 "calmar_ratio": 0.0, "ann_volatility_pct": 0.0}
-    eq = np.array([s.total_equity for s in snaps], dtype=float)
+    # 실제 거래 개시 이후 구간만 — 선행 무거래 평탄구간이 변동성/Sharpe 를 왜곡하지 않도록
+    i0 = _active_start_idx(sim)
+    eq = np.array([s.total_equity for s in snaps], dtype=float)[i0:]
+    if len(eq) < 2:
+        eq = np.array([s.total_equity for s in snaps], dtype=float)
     rets = eq[1:] / eq[:-1] - 1
     valid = rets[~np.isnan(rets)]
     TD = 252
