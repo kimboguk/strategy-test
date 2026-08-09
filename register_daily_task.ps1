@@ -28,6 +28,9 @@ $ExitName = "ATH-Exit-Monitor"
 $ExitScript = "D:\study\finance\trading\dashboard\backend\run_exit_monitor.ps1"
 $ExitDir = "D:\study\finance\trading\dashboard\backend"
 
+# 콘솔 창 없이(hidden) ps1 실행하는 VBS 런처 — 5분 주기 깜빡임 제거
+$Vbs = "D:\study\finance\trading\strategy-test\run_hidden.vbs"
+
 function Unregister-One([string]$name) {
     if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $name -Confirm:$false
@@ -39,8 +42,8 @@ function Unregister-One([string]$name) {
 
 function Register-One([string]$name, [string]$script, [string]$dir, [string]$at, [string]$desc) {
     if (-not (Test-Path $script)) { throw "스크립트 없음: $script" }
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`"" `
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" `
+        -Argument "`"$Vbs`" `"$script`"" `
         -WorkingDirectory $dir
     $trigger = New-ScheduledTaskTrigger -Daily -At $at
     # StartWhenAvailable: 예약 시각에 PC가 꺼져 있었으면 다음 가용 시 실행.
@@ -71,8 +74,8 @@ Register-One $OpenName $OpenScript $OpenDir $OpenEntryAt `
 
 # ③ 장중 청산 감시 — 09:00 시작, 5분 주기로 15:30까지 반복
 if (-not (Test-Path $ExitScript)) { throw "스크립트 없음: $ExitScript" }
-$exitAction = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ExitScript`"" `
+$exitAction = New-ScheduledTaskAction -Execute "wscript.exe" `
+    -Argument "`"$Vbs`" `"$ExitScript`"" `
     -WorkingDirectory $ExitDir
 # 반복 트리거: 09:00 시작 → 5분마다 → 6.5시간(15:30) 동안
 $exitTrigger = New-ScheduledTaskTrigger -Daily -At "09:00"
